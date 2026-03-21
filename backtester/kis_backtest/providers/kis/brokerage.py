@@ -7,7 +7,6 @@ import logging
 from datetime import datetime
 from typing import Callable, List, Optional
 
-import os
 from ...models import Order, Position, OrderSide, OrderType, OrderStatus
 from ...models.trading import AccountBalance, Subscription
 from ...exceptions import KISError, KISOrderError
@@ -307,10 +306,119 @@ class KISBrokerageProvider:
         API: /uapi/domestic-stock/v1/trading/inquire-daily-ccld
         TR ID: TTTC8001R (실전), VTTC8001R (모의)
         
-        TODO: 구현 필요
+        당일 주문/체결을 조회해 Order 모델로 반환.
         """
-        logger.warning("주문 내역 조회는 아직 구현되지 않음")
-        return []
+        tr_id = self._get_tr_id(TrId.ORDERS_REAL, TrId.ORDERS_PAPER)
+
+        today = datetime.now().strftime("%Y%m%d")
+        params = {
+            "CANO": self._auth.account_no,
+            "ACNT_PRDT_CD": self._auth.account_prod,
+            "INQR_STRT_DT": today,
+            "INQR_END_DT": today,
+            "SLL_BUY_DVSN_CD": "00",   # 전체
+            "INQR_DVSN": "00",          # 역순
+            "PDNO": "",                 # 전체 종목
+            "CCLD_DVSN": "00",          # 전체(체결/미체결)
+            "ORD_GNO_BRNO": "",
+            "ODNO": "",
+            "INQR_DVSN_3": "00",
+            "INQR_DVSN_1": "",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+
+        resp = self._auth.get(ApiPath.DOMESTIC_ORDERS, params, tr_id)
+        if not resp.is_ok():
+            raise KISError(f"주문 조회 실패: {resp.error_message}")
+
+        data = resp.get_output1()
+        if not data:
+            return []
+
+        def _pick(item: dict, *keys: str, default: str = ""):
+            for key in keys:
+                if key in item and item[key] is not None:
+                    return item[key]
+            return default
+
+        def _to_int(value, default: int = 0) -> int:
+            try:
+                return int(float(str(value).replace(",", "").strip()))
+            except (ValueError, TypeError):
+                return default
+
+        def _to_float(value, default: float = 0.0) -> float:
+            try:
+                return float(str(value).replace(",", "").strip())
+            except (ValueError, TypeError):
+                return default
+
+        def _to_datetime(date_text: str, time_text: str) -> datetime:
+            dt_compact = f"{date_text}{time_text}".strip()
+            try:
+                return datetime.strptime(dt_compact, "%Y%m%d%H%M%S")
+            except ValueError:
+                return datetime.now()
+
+        def _map_status(order_qty: int, filled_qty: int, item: dict) -> OrderStatus:
+            rmn_qty = _to_int(_pick(item, "rmn_qty", default=max(order_qty - filled_qty, 0)))
+            rejected = str(_pick(item, "rjct_rson", "rjct_rson_name", default="")).strip()
+            canceled = str(_pick(item, "cncl_yn", "cncl_yn_name", default="")).strip().upper()
+
+            if rejected:
+                return OrderStatus.REJECTED
+            if canceled in {"Y", "YES", "1", "취소"}:
+                return OrderStatus.CANCELLED
+            if filled_qty <= 0:
+                return OrderStatus.SUBMITTED
+            if rmn_qty > 0 or filled_qty < order_qty:
+                return OrderStatus.PARTIALLY_FILLED
+            return OrderStatus.FILLED
+
+        orders: List[Order] = []
+        for item in data:
+            try:
+                order_id = str(_pick(item, "odno", "ODNO", default="")).strip()
+                if not order_id:
+                    continue
+
+                symbol = str(_pick(item, "pdno", "PDNO", default="")).strip()
+                side_raw = str(_pick(item, "sll_buy_dvsn_cd", "SLL_BUY_DVSN_CD", default="")).strip()
+                side = OrderSide.BUY if side_raw == "02" else OrderSide.SELL
+
+                ord_qty = _to_int(_pick(item, "ord_qty", "ORD_QTY", default="0"))
+                ord_price = _to_float(_pick(item, "ord_unpr", "ORD_UNPR", default="0"))
+                filled_qty = _to_int(_pick(item, "tot_ccld_qty", "TOT_CCLD_QTY", default="0"))
+                avg_price = _to_float(_pick(item, "avg_prvs", "AVG_PRVS", "avg_ccld_unpr", "AVG_CCLD_UNPR", default=ord_price))
+
+                order_type = OrderType.MARKET if ord_price <= 0 else OrderType.LIMIT
+                order_date = str(_pick(item, "ord_dt", "ORD_DT", default=today)).strip() or today
+                order_time = str(_pick(item, "ord_tmd", "ORD_TMD", default="000000")).strip().zfill(6)
+                created_at = _to_datetime(order_date, order_time)
+                order_status = _map_status(ord_qty, filled_qty, item)
+
+                orders.append(Order(
+                    id=order_id,
+                    symbol=symbol,
+                    side=side,
+                    order_type=order_type,
+                    quantity=ord_qty,
+                    price=ord_price if ord_price > 0 else None,
+                    filled_quantity=filled_qty,
+                    average_price=avg_price,
+                    status=order_status,
+                    created_at=created_at,
+                    updated_at=datetime.now(),
+                ))
+            except Exception as e:
+                logger.warning(f"주문 데이터 파싱 오류: {e}")
+                continue
+
+        if status is not None:
+            orders = [o for o in orders if o.status == status]
+
+        return orders
     
     def subscribe_fills(
         self,

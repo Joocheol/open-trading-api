@@ -1078,6 +1078,13 @@ class LiveClient:
             raise ConfigurationError("brokerage_provider가 설정되지 않았습니다.")
         
         return self._brokerage.get_balance()
+
+    def get_orders(self, status=None):
+        """주문 내역 조회"""
+        if self._brokerage is None:
+            raise ConfigurationError("brokerage_provider가 설정되지 않았습니다.")
+
+        return self._brokerage.get_orders(status=status)
     
     def get_quote(self, symbol: str):
         """현재 호가 조회"""
